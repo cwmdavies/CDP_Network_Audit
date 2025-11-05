@@ -25,30 +25,19 @@ except ImportError:
     from netmiko.ssh_exception import NetmikoAuthenticationException, NetmikoTimeoutException
 
 from paramiko.ssh_exception import SSHException
-from ProgramFiles import config_params  # reads ProgramFiles/config_files/global_config.ini
 
 # Configure logging (use INFO default; can be raised to DEBUG for more detail)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-class ConfigLoader:
-    def __init__(self):
-        self.limit = int(config_params.Settings["LIMIT"])
-        self.timeout = int(config_params.Settings["TIMEOUT"])
-        self.jump_server = config_params.Jump_Servers["ACTIVE"]
-        self.base_dir = Path(".")
-        self.cdp_template = self.base_dir / "ProgramFiles" / "textfsm" / "cisco_ios_show_cdp_neighbors_detail.textfsm"
-        self.ver_template = self.base_dir / "ProgramFiles" / "textfsm" / "cisco_ios_show_version.textfsm"
-        self.excel_template = self.base_dir / "ProgramFiles" / "config_files" / "1 - CDP Network Audit _ Template.xlsx"
-
-        # Validate templates and excel template early to fail fast
-        missing = []
-        for p in (self.cdp_template, self.ver_template, self.excel_template):
-            if not p.exists():
-                missing.append(str(p))
-        if missing:
-            raise FileNotFoundError(f"Required files missing: {', '.join(missing)}")
+# Minimal config (can be overridden with environment variables)
+DEFAULT_LIMIT = int(os.getenv("CDP_LIMIT", "10"))
+DEFAULT_TIMEOUT = int(os.getenv("CDP_TIMEOUT", "10"))
+BASE_DIR = Path(".")
+CDP_TEMPLATE = BASE_DIR / "ProgramFiles" / "textfsm" / "cisco_ios_show_cdp_neighbors_detail.textfsm"
+VER_TEMPLATE = BASE_DIR / "ProgramFiles" / "textfsm" / "cisco_ios_show_version.textfsm"
+EXCEL_TEMPLATE = BASE_DIR / "ProgramFiles" / "config_files" / "1 - CDP Network Audit _ Template.xlsx"
 
 
 class CredentialManager:
@@ -218,8 +207,12 @@ class ExcelReporter:
 
 
 class NetworkDiscoverer:
-    def __init__(self, config: ConfigLoader):
-        self.config = config
+    def __init__(self, timeout: int, limit: int, cdp_template: Path, ver_template: Path):
+        self.timeout = timeout
+        self.limit = limit
+        self.cdp_template = cdp_template
+        self.ver_template = ver_template
+
         self.cdp_neighbour_details: List[Dict] = []
         self.hostnames: set = set()
         self.visited: set = set()
@@ -249,15 +242,8 @@ class NetworkDiscoverer:
             return []
 
     def parse_outputs_and_enqueue_neighbors(self, host: str, cdp_output: str, version_output: str):
-        """
-        Robust parsing + normalization of CDP and version outputs.
-        - Normalizes DESTINATION_HOST to head-only, uppercase.
-        - Adds LOCAL_* fields.
-        - Records hostname/serial/uptime.
-        - Enqueues switch management IPs only once (marks as visited when enqueued).
-        """
-        cdp_list = self._safe_parse_textfsm(self.config.cdp_template, cdp_output)
-        ver_list = self._safe_parse_textfsm(self.config.ver_template, version_output)
+        cdp_list = self._safe_parse_textfsm(self.cdp_template, cdp_output)
+        ver_list = self._safe_parse_textfsm(self.ver_template, version_output)
 
         if ver_list:
             hostname = ver_list[0].get("HOSTNAME", host)
@@ -268,17 +254,14 @@ class NetworkDiscoverer:
             serial_numbers = ""
             uptime = ""
 
-        # Register hostname (data structures) once
         with self.data_lock:
             if hostname:
                 self.hostnames.add(hostname)
                 self.visited_hostnames.add(hostname)
 
-        # Mark the current IP as visited (we have processed or are processing it)
         with self.visited_lock:
             self.visited.add(host)
 
-        # Process CDP rows and decide enqueues
         for entry in cdp_list:
             text = entry.get("DESTINATION_HOST", "")
             head = text.split(".", 1)[0].upper() if text else ""
@@ -296,13 +279,10 @@ class NetworkDiscoverer:
 
             if "Switch" in caps and "Host" not in caps and mgmt_ip:
                 should_enqueue = False
-                # Ensure only one thread enqueues the same IP
                 with self.visited_lock:
                     if mgmt_ip not in self.visited:
-                        # mark visited to prevent duplicate enqueues
                         self.visited.add(mgmt_ip)
                         should_enqueue = True
-                # Also deduplicate by hostname
                 with self.data_lock:
                     if head in self.visited_hostnames:
                         should_enqueue = False
@@ -315,21 +295,26 @@ class NetworkDiscoverer:
 
     def _paramiko_jump_client(self, jump_host: str, username: str, password: str) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # use explicit client attribute to avoid AttributeError on some installs
+        client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
         client.connect(
             hostname=jump_host,
             username=username,
             password=password,
             look_for_keys=False,
             allow_agent=False,
-            banner_timeout=self.config.timeout,
-            auth_timeout=self.config.timeout,
-            timeout=self.config.timeout,
+            banner_timeout=self.timeout,
+            auth_timeout=self.timeout,
+            timeout=self.timeout,
         )
         return client
 
     def _netmiko_via_jump(self, jump_host: str, target_ip: str, primary: bool,
                           primary_user: str, primary_pass: str, answer_user: str, answer_pass: str):
+        """
+        If jump_host is truthy, open a Paramiko SSH tunnel to jump_host and connect to target through it.
+        If jump_host is empty/falsey, connect directly to target_ip with Netmiko.
+        """
         if primary:
             j_user, j_pass = primary_user, primary_pass
             d_user, d_pass = primary_user, primary_pass
@@ -337,6 +322,22 @@ class NetworkDiscoverer:
             j_user, j_pass = primary_user, primary_pass
             d_user, d_pass = answer_user, answer_pass
 
+        # Direct connect when no jump host provided
+        if not jump_host:
+            conn = ConnectHandler(
+                device_type="cisco_ios",
+                host=target_ip,
+                username=d_user,
+                password=d_pass,
+                fast_cli=False,
+                timeout=self.timeout,
+                conn_timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
+            )
+            return conn
+
+        # Otherwise use jump server
         jump = None
         try:
             jump = self._paramiko_jump_client(jump_host, j_user, j_pass)
@@ -351,16 +352,14 @@ class NetworkDiscoverer:
                 password=d_pass,
                 sock=channel,
                 fast_cli=False,
-                timeout=self.config.timeout,
-                conn_timeout=self.config.timeout,
-                banner_timeout=self.config.timeout,
-                auth_timeout=self.config.timeout,
+                timeout=self.timeout,
+                conn_timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
             )
-            # Keep reference so we can close the jump client later when disconnecting
             conn._jump_client = jump
             return conn
         except Exception:
-            # Ensure jump client is closed if we failed after creating it
             if jump is not None:
                 try:
                     jump.close()
@@ -371,10 +370,6 @@ class NetworkDiscoverer:
     def run_device_commands(self, jump_host: str, host: str,
                            primary_user: str, primary_pass: str,
                            answer_user: str, answer_pass: str):
-        """
-        Try primary creds first, fall back to answer creds on authentication failure.
-        Returns tuple (cdp_output, version_output) on success, or raises.
-        """
         try:
             conn = self._netmiko_via_jump(
                 jump_host=jump_host,
@@ -386,8 +381,8 @@ class NetworkDiscoverer:
                 answer_pass=answer_pass,
             )
             try:
-                out_cdp = conn.send_command("show cdp neighbors detail", expect_string=r"#", read_timeout=self.config.timeout)
-                out_ver = conn.send_command("show version", expect_string=r"#", read_timeout=self.config.timeout)
+                out_cdp = conn.send_command("show cdp neighbors detail", expect_string=r"#", read_timeout=self.timeout)
+                out_ver = conn.send_command("show version", expect_string=r"#", read_timeout=self.timeout)
                 return out_cdp, out_ver
             finally:
                 try:
@@ -401,7 +396,6 @@ class NetworkDiscoverer:
                     logger.debug("Error closing jump client after disconnect", exc_info=True)
         except NetmikoAuthenticationException:
             logger.debug("Primary authentication failed for %s; attempting fallback user 'answer'", host)
-            # Try with fallback credentials
             conn = None
             try:
                 conn = self._netmiko_via_jump(
@@ -414,8 +408,8 @@ class NetworkDiscoverer:
                     answer_pass=answer_pass,
                 )
                 try:
-                    out_cdp = conn.send_command("show cdp neighbors detail", expect_string=r"#", read_timeout=self.config.timeout)
-                    out_ver = conn.send_command("show version", expect_string=r"#", read_timeout=self.config.timeout)
+                    out_cdp = conn.send_command("show cdp neighbors detail", expect_string=r"#", read_timeout=self.timeout)
+                    out_ver = conn.send_command("show version", expect_string=r"#", read_timeout=self.timeout)
                     return out_cdp, out_ver
                 finally:
                     try:
@@ -439,7 +433,6 @@ class NetworkDiscoverer:
                 host = self.host_queue.get_nowait()
             except queue.Empty:
                 return
-            # If another thread already marked as visited while queued, skip
             with self.visited_lock:
                 if host in self.visited:
                     self.host_queue.task_done()
@@ -464,7 +457,6 @@ class NetworkDiscoverer:
                 except Exception as e:
                     logger.exception("[%s] Unexpected error", host)
                     last_err = type(e).__name__
-            # After all attempts, mark IP as visited to prevent further retries
             with self.visited_lock:
                 self.visited.add(host)
             if last_err:
@@ -488,7 +480,7 @@ class NetworkDiscoverer:
         results = []
         if not names:
             return
-        with ThreadPoolExecutor(max_workers=min(32, max(4, self.config.limit))) as ex:
+        with ThreadPoolExecutor(max_workers=min(32, max(4, self.limit))) as ex:
             futs = [ex.submit(self.resolve_dns_for_host, n) for n in names]
             for f in as_completed(futs):
                 try:
@@ -501,23 +493,43 @@ class NetworkDiscoverer:
 
 
 def main():
-    config = ConfigLoader()
+    # Use minimal config (env overrides allowed)
+    limit = DEFAULT_LIMIT
+    timeout = DEFAULT_TIMEOUT
+    cdp_template = CDP_TEMPLATE
+    ver_template = VER_TEMPLATE
+    excel_template = EXCEL_TEMPLATE
+
+    # Validate template and excel files early
+    missing = []
+    for p in (cdp_template, ver_template, excel_template):
+        if not p.exists():
+            missing.append(str(p))
+    if missing:
+        logger.error("Required files missing: %s", ", ".join(missing))
+        raise SystemExit(1)
+
     creds = CredentialManager()
-    discoverer = NetworkDiscoverer(config)
-    reporter = ExcelReporter(config.excel_template)
+    discoverer = NetworkDiscoverer(timeout=timeout, limit=limit, cdp_template=cdp_template, ver_template=ver_template)
+    reporter = ExcelReporter(excel_template)
 
     # Interactive input
     site_name, seeds, primary_user, primary_pass, answer_user, answer_pass = creds.prompt_for_inputs()
+
+    # If jump server provided via env use it, otherwise prompt
+    jump_server = os.getenv("CDP_JUMP_SERVER", "").strip()
+    if not jump_server:
+        jump_server = input("Enter jump server IP/hostname to use for SSH proxy (or leave blank to use device directly): ").strip()
+        if not jump_server:
+            logger.info("No jump server provided; you may need direct access to targets from this host.")
 
     # Validate seeds: accept IPs or resolvable hostnames
     validated_seeds = []
     for s in seeds:
         try:
-            # If it's a valid IP, this will succeed
             ipaddress.ip_address(s)
             validated_seeds.append(s)
         except ValueError:
-            # try DNS resolution
             try:
                 resolved = socket.gethostbyname(s)
                 validated_seeds.append(resolved)
@@ -525,25 +537,22 @@ def main():
                 logger.error("Seed '%s' is not a valid IP and could not be resolved. Aborting.", s)
                 raise SystemExit(1)
 
-    # Queue seeds (mark visited to avoid duplicates)
-    for s in validated_seeds:
-        with discoverer.visited_lock:
-            if s not in discoverer.visited:
-                discoverer.visited.add(s)
-                discoverer.host_queue.put(s)
+    # Queue seeds (do not mark visited here — workers will mark processed hosts)
+    for s in set(validated_seeds):
+        discoverer.host_queue.put(s)
 
     # Discovery (threaded)
-    with ThreadPoolExecutor(max_workers=config.limit) as executor:
+    with ThreadPoolExecutor(max_workers=limit) as executor:
         futures = [
             executor.submit(
                 discoverer.discover_worker,
-                config.jump_server,
+                jump_server,
                 primary_user,
                 primary_pass,
                 answer_user,
                 answer_pass,
             )
-            for _ in range(config.limit)
+            for _ in range(limit)
         ]
         for _ in as_completed(futures):
             pass
