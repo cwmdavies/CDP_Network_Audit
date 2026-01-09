@@ -63,7 +63,7 @@ try:
     from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 except ImportError:
     # Older netmiko naming
-    from netmiko.ssh_exception import NetmikoAuthenticationException, NetmikoTimeoutException
+    from netmiko.ssh_exception import NetmikoAuthenticationException, NetmikoTimeoutException # type: ignore
 from paramiko.ssh_exception import SSHException
 
 # --------------------------------------------------------------------------------------
