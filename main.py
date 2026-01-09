@@ -36,9 +36,9 @@ Exit codes:
 - 1  : Required template or Excel file missing
 - 130: Interrupted by user (Ctrl+C)
 
-Author: <your name/team>
+Author: Christopher Davies
+Email: chris.davies@weavermanor.co.uk
 """
-
 import os
 import sys
 import threading
