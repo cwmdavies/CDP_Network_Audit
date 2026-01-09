@@ -52,7 +52,7 @@ import logging.config
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple, List, Dict
-
+import time
 import pandas as pd
 import openpyxl
 import textfsm
@@ -97,7 +97,6 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger(__name__)
-
 
 # --------------------------------------------------------------------------------------
 # Minimal config (can be overridden with environment variables)
@@ -658,63 +657,67 @@ class NetworkDiscoverer:
                 raise
 
     # -------------------------- Worker & DNS --------------------------
+
+
     def discover_worker(self, jump_host, primary_user, primary_pass, answer_user, answer_pass) -> None:
-        """
-        Worker loop that dequeues a host IP, attempts collection (with retry on transient errors),
-        updates shared state, and marks the task done.
-
-        Retries:
-            Up to 3 attempts for timeouts/SSH errors. Auth failures are not retried with the same creds.
-        """
-        while True:
-            try:
-                # Block briefly so workers don't exit when the queue is momentarily empty
-                host = self.host_queue.get(timeout=1.0)
-            except queue.Empty:
-                # If the queue is empty *and* there are no enqueued items, we can stop.
-                with self.visited_lock:
-                    nothing_pending = (len(self.enqueued) == 0)
-                if nothing_pending:
-                    return
-                # Otherwise, loop again and wait for more work
-                continue
-
-            # Host has been dequeued — remove from 'enqueued' so it's eligible again on explicit re-queue.
-            with self.visited_lock:
-                self.enqueued.discard(host)
-
-            # Skip if another worker already completed this host (rare but safe check)
-            if host in self.visited:
-                self.host_queue.task_done()
-                continue
-
-            last_err = None
-            for attempt in range(1, 4):
+        tname = threading.current_thread().name
+        logger.info("Worker start: %s", tname)
+        try:
+            while True:
                 try:
-                    logger.info("[%s] Attempt %d: collecting CDP + version", host, attempt)
-                    cdp_out, ver_out = self.run_device_commands(
-                        jump_host, host, primary_user, primary_pass, answer_user, answer_pass
-                    )
-                    self.parse_outputs_and_enqueue_neighbors(host, cdp_out, ver_out)
-                    last_err = None
-                    break
-                except NetmikoAuthenticationException:
-                    logger.info("[%s] Authentication failed", host)
-                    last_err = "AuthenticationError"
-                    break  # no point retrying with same creds
-                except (NetmikoTimeoutException, SSHException, socket.timeout) as e:
-                    logger.warning("[%s] Connection issue: %s", host, e)
-                    last_err = type(e).__name__
-                except Exception as e:
-                    logger.exception("[%s] Unexpected error", host)
-                    last_err = type(e).__name__
+                    # Block for a bit; this prevents hot spinning and accidental early exits
+                    item = self.host_queue.get(timeout=1.0)
+                except queue.Empty:
+                    # Just wait again; neighbors may still be enqueued by other workers
+                    time.sleep(0.2)
+                    continue
 
-            # Mark the host as visited and record any terminal error
-            with self.visited_lock:
-                self.visited.add(host)
-            if last_err:
-                with self.data_lock:
-                    self.connection_errors.setdefault(host, last_err)
+                # Sentinel to shut down this worker
+                if item is None:
+                    self.host_queue.task_done()
+                    logger.info("Worker exit (sentinel): %s", tname)
+                    return
+
+                host = item
+
+                # Host has been dequeued — remove from 'enqueued' so it's eligible on explicit re-queue.
+                with self.visited_lock:
+                    self.enqueued.discard(host)
+
+                if host in self.visited:
+                    self.host_queue.task_done()
+                    continue
+
+                last_err = None
+                for attempt in range(1, 4):
+                    logger.info("[%s] %s Attempt %d: collecting CDP + version", host, tname, attempt)
+                    try:
+                        cdp_out, ver_out = self.run_device_commands(
+                            jump_host, host, primary_user, primary_pass, answer_user, answer_pass
+                        )
+                        self.parse_outputs_and_enqueue_neighbors(host, cdp_out, ver_out)
+                        last_err = None
+                        break
+                    except NetmikoAuthenticationException:
+                        logger.info("[%s] Authentication failed", host)
+                        last_err = "AuthenticationError"
+                        break
+                    except (NetmikoTimeoutException, SSHException, socket.timeout) as e:
+                        logger.warning("[%s] Connection issue: %s", host, e)
+                        last_err = type(e).__name__
+                    except Exception:
+                        logger.exception("[%s] Unexpected error", host)
+                        last_err = "UnexpectedError"
+
+                with self.visited_lock:
+                    self.visited.add(host)
+                if last_err:
+                    with self.data_lock:
+                        self.connection_errors.setdefault(host, last_err)
+
+                self.host_queue.task_done()
+        except Exception:
+            logger.exception("Worker crashed: %s", tname)
 
             self.host_queue.task_done()
 
@@ -759,6 +762,7 @@ def main() -> None:
     - Resolve DNS and emit Excel report.
     - Print a brief summary.
     """
+   
     # Use minimal config (env overrides allowed)
     limit = DEFAULT_LIMIT
     timeout = DEFAULT_TIMEOUT
@@ -785,7 +789,12 @@ def main() -> None:
     # If jump server provided via env use it, otherwise prompt
     jump_server = os.getenv("CDP_JUMP_SERVER", "").strip()
     if not jump_server:
-        jump_server = input("Enter jump server IP/hostname to use for SSH proxy (or leave blank to use device directly): ").strip()
+        jump_server = input(
+            f"\nEnter jump server IP/hostname to use for SSH proxy (or leave blank to use device directly) \n"
+            f"GBMKD1V-APPAD03: 10.112.250.6\n"
+            f"GBMKD1V-APPAD03: 10.80.250.5\n"
+            f"Enter IP Address:"
+            ).strip()
     if not jump_server:
         logger.info("No jump server provided; you may need direct access to targets from this host.")
 
@@ -824,9 +833,20 @@ def main() -> None:
             )
             for _ in range(limit)
         ]
-        for _ in as_completed(futures):
-            pass
-    discoverer.host_queue.join()
+
+        # Wait until all tasks that were put() are processed
+        discoverer.host_queue.join()
+
+        # Now tell workers to exit
+        for _ in range(limit):
+            discoverer.host_queue.put(None)
+
+        # Ensure sentinels are consumed
+        discoverer.host_queue.join()
+
+        # Wait for all worker threads to finish
+        for f in futures:
+            f.result()
 
     # DNS resolution (post processing)
     discoverer.resolve_dns_parallel()
