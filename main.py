@@ -580,7 +580,7 @@ class NetworkDiscoverer:
             local_addr = ("127.0.0.1", 0)
             channel = transport.open_channel("direct-tcpip", dest_addr, local_addr, timeout=self.timeout)
             logger.debug("[%s] Jump channel opened via %s", target_ip, jump_host)
-            
+
             conn = ConnectHandler(
                 device_type="cisco_ios",
                 host=target_ip,
