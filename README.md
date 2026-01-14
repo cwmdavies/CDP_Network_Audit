@@ -232,7 +232,7 @@ Done!
 ---
 
 ## 📝 License
-MIT
+MIT License
 
 ## 👤 Author
 Christopher Davies
