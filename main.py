@@ -37,7 +37,6 @@ Exit codes:
 - 130: Interrupted by user (Ctrl+C)
 
 Author: Christopher Davies
-Email: chris.davies@weavermanor.co.uk
 """
 import os
 import sys
